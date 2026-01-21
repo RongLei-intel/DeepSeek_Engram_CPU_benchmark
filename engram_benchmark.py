@@ -57,8 +57,6 @@ except:
     device = torch.device("hpu")
 cpu_device = torch.device("cpu")
 
-print(torch.backends.mkldnn.is_available())
-
 @dataclass
 class EngramConfig:
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
@@ -74,7 +72,7 @@ class EngramConfig:
 @dataclass
 class BackBoneConfig:
     hidden_size: int = 1024
-    hc_mult: int = 1
+    hc_mult: int = 4
     vocab_size: int = 129280
     num_layers: int = 30
     
@@ -397,9 +395,8 @@ class Engram(nn.Module):
         keys = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
-            # normed_key = self.norm1[hc_idx](key)
-            # keys.append(normed_key)
-            keys.append(key)
+            normed_key = self.norm1[hc_idx](key)
+            keys.append(normed_key)
         value = self.value_proj(embeddings).unsqueeze(2)
         return keys,value
 
