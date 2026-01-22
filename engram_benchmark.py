@@ -42,19 +42,24 @@ from dataclasses import dataclass, field
 import math
 import time
 import argparse
+from contextlib import nullcontext 
 
 ## third-class
 from sympy import isprime
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
 
+activities = [ProfilerActivity.CPU]
 try:
     device = torch.cuda.current_device()
+    activities.append(ProfilerActivity.CUDA)
 except:
     device = torch.device("hpu")
+    activities.append(ProfilerActivity.HPU)
 cpu_device = torch.device("cpu")
 
 @dataclass
@@ -375,16 +380,24 @@ class Engram(nn.Module):
         self.key_projs = nn.ModuleList(
             [nn.Linear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
         )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        # self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        # self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+
+        # use optimized rmsnorm from sgl_kernel
+        self.norm1 = nn.ModuleList([torch.ops.sgl_kernel.rmsnorm_cpu(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        self.norm2 = nn.ModuleList([torch.ops.sgl_kernel.rmsnorm_cpu(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
     
     def step1_hash_and_embed(self, input_ids):
         """
         Step 1: Hash input IDs and retrieve embeddings.
         Returns: embeddings [B, L, engram_hidden_size]
         """
+        start_time = time.perf_counter()
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        mid_time = time.perf_counter()
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        end_time = time.perf_counter()
+        print(f"Step 1 Timing: Hashing: {(mid_time - start_time)*1000:.2f} ms, Embedding: {(end_time - mid_time)*1000:.2f} ms")
         return embeddings
 
     def step2_compute_kv(self, embeddings):
@@ -418,7 +431,7 @@ class Engram(nn.Module):
 
         # Scenario 1 (Default): Hash & Embed (CPU) -> Compute KV (CPU) -> Upload KV
         for hc_idx in range(backbone_config.hc_mult):
-            key = self.key_projs[hc_idx](embeddings)
+            key = self.key_projs[hc_idx](embeddings) #64，4096，1024 @ 1024，1024
             normed_key = self.norm1[hc_idx](key)
             _ = normed_key.to(device)
         value = self.value_proj(embeddings).unsqueeze(2)
@@ -441,7 +454,7 @@ class TransformerBlock(nn.Module):
         hidden_states = self.moe(hidden_states) + hidden_states
         return hidden_states
 
-def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,dtype=torch.bfloat16):
+def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,dtype=torch.bfloat16,enable_profiler=False):
     print(f"Preparing Engram Component Benchmark (CPU)...")
     
     # Settings
@@ -461,6 +474,23 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
         run_cases = all_cases
     else:
         run_cases = set(target_cases)
+
+    # Setup Profiler
+    prof_ctx = nullcontext()
+    if enable_profiler:
+        print("PyTorch Profiler Enabled: Capturing traces to './log'...")
+        prof_ctx = profile(
+            activities=activities,
+            schedule=schedule(wait=1, warmup=2, active=3, repeat=0),
+            on_trace_ready=tensorboard_trace_handler('./log'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+
+    # Helper for creating trace scopes
+    def trace(name):
+        return record_function(name) if enable_profiler else nullcontext()
 
     print(f"Settings: Batch={batch_size}, SeqLen={seq_len}, hc_mult={backbone_config.hc_mult}, LayerID={target_layer_id}, Dtype={dtype}")
     print(f"Selected Cases: {run_cases}")
@@ -515,21 +545,26 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
     sizes_bytes["keys"] = sum([k.numel() for k in ref_keys]) * ref_keys[0].element_size()
     sizes_bytes["value"] = ref_value.numel() * ref_value.element_size()
 
+    # Start profiler if enabled
+    if enable_profiler:
+        prof_ctx.start()
+
     with torch.no_grad():
         for i in range(iterations):
             print(f"Iteration {i+1}/{iterations}...", end="\r")
-            
             # Full Forward Baselines
             if "e2e_kv_on_cpu" in run_cases:
                 time.sleep(0.005)
                 t_start = time.perf_counter()
-                _ = engram_layer(input_ids=input_ids, compute_kv_loc="cpu")
+                with trace("e2e_kv_on_cpu"):
+                    _ = engram_layer(input_ids=input_ids, compute_kv_loc="cpu")
                 results["e2e_kv_on_cpu"].append((time.perf_counter() - t_start) * 1000)
 
             if "e2e_kv_on_gpu" in run_cases:
                 time.sleep(0.005)
                 t_start = time.perf_counter()
-                _ = engram_layer(input_ids=input_ids, compute_kv_loc="gpu")
+                with trace("e2e_kv_on_gpu"):
+                    _ = engram_layer(input_ids=input_ids, compute_kv_loc="gpu")
                 results["e2e_kv_on_gpu"].append((time.perf_counter() - t_start) * 1000)
 
             # Component Breakdown
@@ -541,36 +576,47 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
             if "hash_embed_cpu" in run_cases:
                 time.sleep(0.005)
                 t_start_1 = time.perf_counter()
-                embeddings = engram_layer.step1_hash_and_embed(input_ids)
+                with trace("step1_hash_embed_cpu"):
+                    embeddings = engram_layer.step1_hash_and_embed(input_ids)
                 t_end_1 = time.perf_counter()
                 results["hash_embed_cpu"].append((t_end_1 - t_start_1) * 1000)
             
             if "upload_emb_to_gpu" in run_cases or "compute_kv_cpu" in run_cases or "upload_kv_to_gpu" in run_cases:
-                # 3. Upload Embedding
-                if "upload_emb_to_gpu" in run_cases:
-                    time.sleep(0.005)
-                    t_start_up1 = time.perf_counter()
-                    _ = ref_embeddings.to(device, non_blocking=False)
-                    t_end_up1 = time.perf_counter()
-                    results["upload_emb_to_gpu"].append((t_end_up1 - t_start_up1) * 1000)
                 
                 # 2. Key & Value Calculation
                 if "compute_kv_cpu" in run_cases:
                     time.sleep(0.005)
                     t_start_2 = time.perf_counter()
-                    keys, value = engram_layer.step2_compute_kv(embeddings)
+                    with trace("step2_compute_kv_cpu"):
+                        keys, value = engram_layer.step2_compute_kv(embeddings)
                     t_end_2 = time.perf_counter()
                     results["compute_kv_cpu"].append((t_end_2 - t_start_2) * 1000)
+
+                # 3. Upload Embedding
+                if "upload_emb_to_gpu" in run_cases:
+                    time.sleep(0.005)
+                    t_start_up1 = time.perf_counter()
+                    with trace("step3_upload_emb_to_gpu"):
+                        _ = ref_embeddings.to(device, non_blocking=False)
+                    t_end_up1 = time.perf_counter()
+                    results["upload_emb_to_gpu"].append((t_end_up1 - t_start_up1) * 1000)
 
                 # 4. Upload Key & Value (Simulate)
                 if "upload_kv_to_gpu" in run_cases:
                     time.sleep(0.005)
                     t_start_up2 = time.perf_counter()
-                    for key in ref_keys:
-                        _ = key.to(device,non_blocking=False)
-                    _ = ref_value.to(device,non_blocking=False)
+                    with trace("step4_upload_kv_to_gpu"):
+                        for key in ref_keys:
+                            _ = key.to(device,non_blocking=False)
+                        _ = ref_value.to(device,non_blocking=False)
                     t_end_up2 = time.perf_counter()
                     results["upload_kv_to_gpu"].append((t_end_up2 - t_start_up2) * 1000)
+
+            if enable_profiler:
+                prof_ctx.step()
+
+    if enable_profiler:
+        prof_ctx.stop()
 
     # Reporting
     print("\n" + "="*90)
@@ -682,6 +728,11 @@ if __name__ == '__main__':
         choices=["float32", "float16", "bfloat16"],
         help="Data type for the model."
     )
+    parser.add_argument(
+        "--enable_profiler",
+        action="store_true",
+        help="Enable PyTorch Profiler to capture traces."
+    )
     args = parser.parse_args()
 
     # Map CLI args to internal keys
@@ -716,5 +767,6 @@ if __name__ == '__main__':
         iterations=args.iterations,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
-        dtype=dtype_map[args.dtype]
+        dtype=dtype_map[args.dtype],
+        enable_profiler=args.enable_profiler
     )
