@@ -49,6 +49,7 @@ from sympy import isprime
 import numpy as np
 import torch
 import torch.nn as nn
+import sgl_kernel
 from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
@@ -350,6 +351,15 @@ class MultiHeadEmbedding(nn.Module):
         output = self.embedding(shifted_input_ids)
         
         return output
+
+class SglRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        return torch.ops.sgl_kernel.rmsnorm_cpu(x, self.weight, self.eps)
     
 class Engram(nn.Module):
     def __init__(self,layer_id):
@@ -384,8 +394,9 @@ class Engram(nn.Module):
         # self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
 
         # use optimized rmsnorm from sgl_kernel
-        self.norm1 = nn.ModuleList([torch.ops.sgl_kernel.rmsnorm_cpu(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-        self.norm2 = nn.ModuleList([torch.ops.sgl_kernel.rmsnorm_cpu(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        variance_epsilon = 1e-6
+        self.norm1 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
+        self.norm2 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
     
     def step1_hash_and_embed(self, input_ids):
         """
@@ -443,15 +454,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn = lambda x:x
         self.moe  = lambda x:x
-        self.engram = None
-        if layer_id in engram_cfg.layer_ids:
-            self.engram = Engram(layer_id=layer_id)
-    
-    def forward(self,input_ids,hidden_states):
-        if self.engram is not None:
-            hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
-        hidden_states = self.attn(hidden_states) + hidden_states
-        hidden_states = self.moe(hidden_states) + hidden_states
+        self.eng
         return hidden_states
 
 def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,dtype=torch.bfloat16,enable_profiler=False):
