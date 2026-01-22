@@ -49,7 +49,10 @@ from sympy import isprime
 import numpy as np
 import torch
 import torch.nn as nn
-import sgl_kernel
+try:
+    import sgl_kernel
+except ImportError:
+    pass
 from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
@@ -361,9 +364,27 @@ class SglRMSNorm(nn.Module):
     def forward(self, x):
         return torch.ops.sgl_kernel.rmsnorm_cpu(x, self.weight, self.eps)
     
-class Engram(nn.Module):
-    def __init__(self,layer_id):
+class SglLinear(nn.Module):
+    def __init__(self, K, N, bias=True):
         super().__init__()
+        self.N = N
+        self.K = K
+        self.weight = nn.Parameter(torch.randn(N, K))
+        if bias:
+            self.bias = nn.Parameter(torch.randn(N))
+        else:
+            self.register_parameter('bias', None)
+        self.packed_weight = torch.ops.sgl_kernel.convert_weight_packed(self.weight)
+
+    def forward(self, input):
+        return torch.ops.sgl_kernel.weight_packed_linear(
+            input, self.packed_weight, self.bias, True
+        )
+    
+class Engram(nn.Module):
+    def __init__(self,layer_id,enable_sgl_kernel=False):
+        super().__init__()
+        self.enable_sgl_kernel = enable_sgl_kernel
         self.layer_id = layer_id
         self.hash_mapping = NgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
@@ -386,17 +407,24 @@ class Engram(nn.Module):
             hc_mult     = backbone_config.hc_mult,
         )
         engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
-        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size)
-        self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
-        )
-        # self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-        # self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-
-        # use optimized rmsnorm from sgl_kernel
-        variance_epsilon = 1e-6
-        self.norm1 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
-        self.norm2 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
+        if enable_sgl_kernel:
+            self.value_proj = SglLinear(engram_hidden_size,backbone_config.hidden_size)
+            self.key_projs = nn.ModuleList(
+                [SglLinear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
+            )
+        else:
+            self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size)
+            self.key_projs = nn.ModuleList(
+                [nn.Linear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
+            )
+        if not enable_sgl_kernel:
+            self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+            self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        else:
+            # use optimized rmsnorm from sgl_kernel
+            variance_epsilon = 1e-6
+            self.norm1 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
+            self.norm2 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
     
     def step1_hash_and_embed(self, input_ids):
         """
@@ -417,8 +445,12 @@ class Engram(nn.Module):
         Returns: value [B, L, HC, D] (The signal before ShortConv)
         """
         keys = []
+        if self.enable_sgl_kernel:
+            embeddings = embeddings.view(-1, backbone_config.hidden_size)
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
+            if self.enable_sgl_kernel:
+                key = key.view(-1, backbone_config.hidden_size)
             normed_key = self.norm1[hc_idx](key)
             keys.append(normed_key)
         value = self.value_proj(embeddings).unsqueeze(2)
@@ -439,10 +471,14 @@ class Engram(nn.Module):
         if compute_kv_loc == "gpu":
             # Scenario 2: Hash & Embed (CPU) -> Upload Embedding -> (KV Compute on GPU)
             return embeddings.to(device)
-
+            
+        if self.enable_sgl_kernel:
+            embeddings = embeddings.view(-1, backbone_config.hidden_size)
         # Scenario 1 (Default): Hash & Embed (CPU) -> Compute KV (CPU) -> Upload KV
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings) #64，4096，1024 @ 1024，1024
+            if self.enable_sgl_kernel:
+                key = key.view(-1, backbone_config.hidden_size)
             normed_key = self.norm1[hc_idx](key)
             _ = normed_key.to(device)
         value = self.value_proj(embeddings).unsqueeze(2)
@@ -457,7 +493,7 @@ class TransformerBlock(nn.Module):
         self.eng
         return hidden_states
 
-def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,dtype=torch.bfloat16,enable_profiler=False):
+def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,dtype=torch.bfloat16,enable_profiler=False,enable_sgl_kernel=False):
     print(f"Preparing Engram Component Benchmark (CPU)...")
     
     # Settings
@@ -507,7 +543,7 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
     print("Initializing Engram Layer...")
     try:
         t0_init = time.time()
-        engram_layer = Engram(layer_id=target_layer_id).to(dtype).to(cpu_device)
+        engram_layer = Engram(layer_id=target_layer_id,enable_sgl_kernel=enable_sgl_kernel).to(dtype).to(cpu_device)
         print(f"Initialization finished in {time.time() - t0_init:.2f} seconds.")
     except Exception as e:
         print(f"Error initializing Engram layer: {e}")
@@ -736,6 +772,11 @@ if __name__ == '__main__':
         action="store_true",
         help="Enable PyTorch Profiler to capture traces."
     )
+    parser.add_argument(
+        "--enable_sgl_kernel",
+        action="store_true",
+        help="Enable SGL Kernel if available."
+    )
     args = parser.parse_args()
 
     # Map CLI args to internal keys
@@ -771,5 +812,6 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         dtype=dtype_map[args.dtype],
-        enable_profiler=args.enable_profiler
+        enable_profiler=args.enable_profiler,
+        enable_sgl_kernel=args.enable_sgl_kernel
     )
