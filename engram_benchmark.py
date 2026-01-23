@@ -59,11 +59,18 @@ from tokenizers import normalizers, Regex
 
 activities = [ProfilerActivity.CPU]
 try:
-    device = torch.cuda.current_device()
-    activities.append(ProfilerActivity.CUDA)
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        activities.append(ProfilerActivity.CUDA)
+    elif torch.is_hpu_available():
+        # Try to initialize HPU device
+        device = torch.device("hpu")
+        activities.append(ProfilerActivity.HPU)
+    else:
+        device = torch.device("cpu")
 except:
-    device = torch.device("hpu")
-    activities.append(ProfilerActivity.HPU)
+    device = torch.device("cpu")
+
 cpu_device = torch.device("cpu")
 
 @dataclass
@@ -161,6 +168,7 @@ class ShortConv(nn.Module):
         norm_eps: float = 1e-5,
         hc_mult: int = 4,
         activation: bool = True,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.hc_mult = hc_mult
@@ -175,10 +183,11 @@ class ShortConv(nn.Module):
             bias=False,
             padding=(kernel_size - 1) * dilation,
             dilation=dilation,
+            dtype=dtype
         )
 
         self.norms = nn.ModuleList([
-            nn.RMSNorm(hidden_size, eps=norm_eps) 
+            nn.RMSNorm(hidden_size, eps=norm_eps).to(dtype) 
             for _ in range(hc_mult)
         ])
         
@@ -335,7 +344,7 @@ class NgramHashMapping:
         return hash_ids_for_all_layers
 
 class MultiHeadEmbedding(nn.Module):
-    def __init__(self, list_of_N: List[int], D: int):
+    def __init__(self, list_of_N: List[int], D: int, dtype: torch.dtype = torch.bfloat16):
         super().__init__()
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
@@ -347,7 +356,7 @@ class MultiHeadEmbedding(nn.Module):
         self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
         
         total_N = sum(list_of_N)
-        self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
+        self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D, dtype=dtype)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         shifted_input_ids = input_ids + self.offsets
@@ -356,22 +365,20 @@ class MultiHeadEmbedding(nn.Module):
         return output
 
 class SglRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps=1e-6, dtype=torch.bfloat16):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(hidden_size))
+        self.weight = nn.Parameter(torch.randn(hidden_size,dtype=dtype))
         self.eps = eps
 
     def forward(self, x):
         return torch.ops.sgl_kernel.rmsnorm_cpu(x, self.weight, self.eps)
     
 class SglLinear(nn.Module):
-    def __init__(self, K, N, bias=True):
+    def __init__(self, K, N, bias=True,dtype=torch.bfloat16):
         super().__init__()
-        self.N = N
-        self.K = K
-        self.weight = nn.Parameter(torch.randn(N, K))
+        self.weight = nn.Parameter(torch.randn(N, K, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.randn(N))
+            self.bias = nn.Parameter(torch.randn(N,dtype=torch.float32))
         else:
             self.register_parameter('bias', None)
         self.packed_weight = torch.ops.sgl_kernel.convert_weight_packed(self.weight)
@@ -382,7 +389,7 @@ class SglLinear(nn.Module):
         )
     
 class Engram(nn.Module):
-    def __init__(self,layer_id,enable_sgl_kernel=False):
+    def __init__(self,layer_id,enable_sgl_kernel=False, dtype=torch.bfloat16):
         super().__init__()
         self.enable_sgl_kernel = enable_sgl_kernel
         self.layer_id = layer_id
@@ -399,32 +406,34 @@ class Engram(nn.Module):
         self.multi_head_embedding = MultiHeadEmbedding(
             list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
             D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
+            dtype=dtype
         )
         self.short_conv = ShortConv(
             hidden_size = backbone_config.hidden_size,
             kernel_size = engram_cfg.kernel_size,
             dilation    = engram_cfg.max_ngram_size,
             hc_mult     = backbone_config.hc_mult,
+            dtype=dtype
         )
         engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
         if enable_sgl_kernel:
-            self.value_proj = SglLinear(engram_hidden_size,backbone_config.hidden_size)
+            self.value_proj = SglLinear(engram_hidden_size,backbone_config.hidden_size, dtype=dtype)
             self.key_projs = nn.ModuleList(
-                [SglLinear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
+                [SglLinear(engram_hidden_size,backbone_config.hidden_size, dtype=dtype) for _ in range(backbone_config.hc_mult)]
             )
         else:
-            self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size)
+            self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size, dtype=dtype)
             self.key_projs = nn.ModuleList(
-                [nn.Linear(engram_hidden_size,backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
+                [nn.Linear(engram_hidden_size,backbone_config.hidden_size, dtype=dtype) for _ in range(backbone_config.hc_mult)]
             )
         if not enable_sgl_kernel:
-            self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-            self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+            self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(dtype) for _ in range(backbone_config.hc_mult)])
+            self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(dtype) for _ in range(backbone_config.hc_mult)])
         else:
             # use optimized rmsnorm from sgl_kernel
             variance_epsilon = 1e-6
-            self.norm1 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
-            self.norm2 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon) for _ in range(backbone_config.hc_mult)])
+            self.norm1 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon, dtype=dtype) for _ in range(backbone_config.hc_mult)])
+            self.norm2 = nn.ModuleList([SglRMSNorm(backbone_config.hidden_size, variance_epsilon, dtype=dtype) for _ in range(backbone_config.hc_mult)])
     
     def step1_hash_and_embed(self, input_ids):
         """
@@ -485,13 +494,7 @@ class Engram(nn.Module):
         value_ongpu = value.to(device)
         return value_ongpu 
 
-class TransformerBlock(nn.Module):
-    def __init__(self,layer_id):
-        super().__init__()
-        self.attn = lambda x:x
-        self.moe  = lambda x:x
-        self.eng
-        return hidden_states
+
 
 def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,dtype=torch.bfloat16,enable_profiler=False,enable_sgl_kernel=False):
     print(f"Preparing Engram Component Benchmark (CPU)...")
@@ -510,9 +513,24 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
     ]
     
     if target_cases is None or "all" in target_cases:
-        run_cases = all_cases
+        run_cases = set(all_cases)
     else:
         run_cases = set(target_cases)
+
+    # Detect environment constraints
+    is_pure_cpu = False
+    if isinstance(device, torch.device) and device.type == "cpu":
+        is_pure_cpu = True
+    
+    if is_pure_cpu:
+        print("!! No GPU/HPU detected. Running in pure CPU mode. !!")
+        print("!! Filtering out transfer/GPU/E2E cases. Disabling pin_memory. !!")
+        # Filter strictly to CPU compute cases only
+        gpu_cases = {"upload_emb_to_gpu", "upload_kv_to_gpu", "e2e_kv_on_gpu", "e2e_kv_on_cpu"}
+        run_cases = run_cases - gpu_cases
+        print(f"Adjusted Cases: {run_cases}")
+
+    use_pin_memory = not is_pure_cpu
 
     # Setup Profiler
     prof_ctx = nullcontext()
@@ -543,7 +561,7 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
     print("Initializing Engram Layer...")
     try:
         t0_init = time.time()
-        engram_layer = Engram(layer_id=target_layer_id,enable_sgl_kernel=enable_sgl_kernel).to(dtype).to(cpu_device)
+        engram_layer = Engram(layer_id=target_layer_id,enable_sgl_kernel=enable_sgl_kernel,dtype=dtype).to(cpu_device)
         print(f"Initialization finished in {time.time() - t0_init:.2f} seconds.")
     except Exception as e:
         print(f"Error initializing Engram layer: {e}")
@@ -553,10 +571,13 @@ def benchmark_engram(target_cases=None,iterations=50,batch_size=64,seq_len=4096,
     print("Pre-calculating reference tensors for isolated tests...")
     with torch.no_grad():
         ref_embeddings = engram_layer.step1_hash_and_embed(input_ids)
-        ref_embeddings = ref_embeddings.pin_memory()
+        if use_pin_memory:
+            ref_embeddings = ref_embeddings.pin_memory()
+        
         ref_keys, ref_value = engram_layer.step2_compute_kv(ref_embeddings)
-        ref_keys = [k.pin_memory() for k in ref_keys]
-        ref_value = ref_value.pin_memory()
+        if use_pin_memory:
+            ref_keys = [k.pin_memory() for k in ref_keys]
+            ref_value = ref_value.pin_memory()
 
     # Warmup
     print("Warming up (5 iters)...")
